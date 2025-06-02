@@ -6,14 +6,18 @@ import json
 import tempfile
 import time
 import openai
+import pymongo
 from dotenv import load_dotenv
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 from langchain_groq import ChatGroq
 llm = ChatGroq(api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
 from pymongo import MongoClient
-from bson.objectid import ObjectId
 import bson
+from urllib.parse import quote_plus
+from bson.objectid import ObjectId
+
+
 
 from discussions import (
     get_all_posts, 
@@ -36,6 +40,26 @@ from ai_helper import (
 )
 from email_handler import send_task_email
 from task_utils import calculate_initial_date, create_gantt_chart
+
+# Load environment variables
+load_dotenv()
+
+# Get raw credentials
+raw_username = os.getenv("MONGO_USER")
+raw_password = os.getenv("MONGO_PASS")
+cluster = os.getenv("MONGO_CLUSTER")
+db_name = os.getenv("MONGO_DB", "discussions_db")
+
+# Encode username and password
+username = quote_plus(raw_username)
+password = quote_plus(raw_password)
+
+# Mongo URI and connection
+MONGO_URI = f"mongodb+srv://{username}:{password}@{cluster}/{db_name}?retryWrites=true&w=majority"
+client = MongoClient(MONGO_URI)
+db = client[db_name]
+
+chat_history_collection = db["chat_history"]  # ✅ NEW collection for saved chat history
 
 # Constants
 CHAT_HISTORY_DIR = "chat_history"
@@ -471,7 +495,6 @@ def email_page():
                         print(f"❌ Failed to send email: {e}")  # Debugging
 
 
-
 def resource_bot_page():
     st.header("🤖 Resource Manager & Chat History")
     
@@ -507,7 +530,11 @@ def resource_bot_page():
                     
                 if st.button("Save to History", use_container_width=True):
                     if user_input and "current_suggestion" in st.session_state:
-                        save_suggestion(user_input, st.session_state.current_suggestion)
+                        # Save to MongoDB
+                        chat_history_collection.insert_one({
+                            "task": user_input,
+                            "suggestion": st.session_state.current_suggestion
+                        })
                         st.rerun()
             
             # Show recent conversations
@@ -522,30 +549,30 @@ def resource_bot_page():
         # Chat History Section
         with st.container(border=True):
             st.subheader("Saved Suggestions", divider="rainbow")
-            chat_files = list_saved_chats()
+
+            # Fetch saved chats from MongoDB
+            chat_docs = list(chat_history_collection.find({}, {"task": 1}))
             
-            if chat_files:
-                selected_file = st.selectbox("Select saved suggestion:", chat_files)
+            if chat_docs:
+                options = [f"{str(doc['_id'])} - {doc['task'][:30]}..." 
+                           for doc in chat_docs 
+                           if '_id' in doc and 'task' in doc]
+                
+                selected = st.selectbox("Select saved suggestion:", options)
+                selected_id = selected.split(" - ")[0] if selected else None
+                
+                selected_doc = chat_history_collection.find_one({"_id": ObjectId(selected_id)}) if selected_id else None
                 
                 cols = st.columns([1, 4])
                 with cols[0]:
                     if st.button("Load Selected", help="Load this suggestion into the assistant"):
-                        try:
-                            with open(os.path.join(CHAT_HISTORY_DIR, selected_file), "r", encoding="utf-8") as file:
-                                content = file.read().strip()
-                            st.session_state.current_suggestion = content
+                        if selected_doc:
+                            st.session_state.current_suggestion = selected_doc["suggestion"]
                             st.rerun()
-                        except Exception as e:
-                            st.error(f"Error loading file: {e}")
                 
                 with cols[1]:
-                    if selected_file:
-                        try:
-                            with open(os.path.join(CHAT_HISTORY_DIR, selected_file), "r", encoding="utf-8") as file:
-                                content = file.read().strip()
-                            st.text_area("Suggestion Content", value=content, height=200, key=f"view_{selected_file}")
-                        except Exception as e:
-                            st.error(f"Error reading file: {e}")
+                    if selected_doc:
+                        st.text_area("Suggestion Content", value=selected_doc["suggestion"], height=200, key=f"view_{selected_id}")
             else:
                 st.info("No saved suggestions yet. Get some recommendations first!")
 
